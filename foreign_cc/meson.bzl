@@ -1,5 +1,6 @@
 """A rule for building projects using the [Meson](https://mesonbuild.com/) build system"""
 
+load("@rules_cc//cc:defs.bzl", "CcInfo")
 load("//foreign_cc:utils.bzl", "full_label")
 load("//foreign_cc/built_tools:meson_build.bzl", "meson_tool")
 load(
@@ -198,9 +199,6 @@ meson = rule(
         "@rules_foreign_cc//foreign_cc/private/framework:shell_toolchain",
         "@bazel_tools//tools/cpp:toolchain_type",
     ],
-    # TODO: Remove once https://github.com/bazelbuild/bazel/issues/11584 is closed and the min supported
-    # version is updated to a release of Bazel containing the new default for this setting.
-    incompatible_use_toolchain_transition = True,
 )
 
 def meson_with_requirements(name, requirements, **kwargs):

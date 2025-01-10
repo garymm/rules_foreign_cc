@@ -6,6 +6,7 @@ load("@bazel_features//:features.bzl", "bazel_features")
 load("@bazel_skylib//lib:collections.bzl", "collections")
 load("@bazel_skylib//lib:paths.bzl", "paths")
 load("@bazel_tools//tools/cpp:toolchain_utils.bzl", "find_cpp_toolchain")
+load("@rules_cc//cc:defs.bzl", "CcInfo", "cc_common")
 load("//foreign_cc:providers.bzl", "ForeignCcArtifactInfo", "ForeignCcDepsInfo")
 load("//foreign_cc/private:detect_root.bzl", "filter_containing_dirs_from_inputs")
 load(
@@ -298,14 +299,13 @@ dependencies.""",
 def _is_msvc_var(var):
     return var == "INCLUDE" or var == "LIB"
 
-def get_env_prelude(ctx, lib_name, data_dependencies, target_root):
+def get_env_prelude(ctx, installdir, data_dependencies):
     """Generate a bash snippet containing environment variable definitions
 
     Args:
         ctx (ctx): The rule's context object
-        lib_name (str): The name of the target being built
+        installdir (str): The path from the root target's directory in the build output
         data_dependencies (list): A list of targets representing dependencies
-        target_root (str): The path from the root target's directory in the build output
 
     Returns:
         tuple: A list of environment variables to define in the build script and a dict
@@ -313,7 +313,7 @@ def get_env_prelude(ctx, lib_name, data_dependencies, target_root):
     """
     env_snippet = [
         "export EXT_BUILD_ROOT=##pwd##",
-        "export INSTALLDIR=$$EXT_BUILD_ROOT$$/" + target_root + "/" + lib_name,
+        "export INSTALLDIR=$$EXT_BUILD_ROOT$$/" + installdir,
         "export BUILD_TMPDIR=$$INSTALLDIR$$.build_tmpdir",
         "export EXT_BUILD_DEPS=$$INSTALLDIR$$.ext_build_deps",
     ]
@@ -447,7 +447,8 @@ def cc_external_rule_impl(ctx, attrs):
     # Also add legacy dependencies while they're still available
     data_dependencies += ctx.attr.tools_deps + ctx.attr.additional_tools
 
-    env_prelude = get_env_prelude(ctx, lib_name, data_dependencies, target_root)
+    installdir = target_root + "/" + lib_name
+    env_prelude = get_env_prelude(ctx, installdir, data_dependencies)
 
     postfix_script = [attrs.postfix_script]
     if not attrs.postfix_script:
@@ -491,7 +492,13 @@ def cc_external_rule_impl(ctx, attrs):
         convert_shell_script(ctx, script_lines),
         "",
     ])
-    wrapped_outputs = wrap_outputs(ctx, lib_name, attrs.configure_name, script_text)
+    wrapped_outputs = wrap_outputs(
+        ctx,
+        lib_name = lib_name,
+        configure_name = attrs.configure_name,
+        script_text = script_text,
+        env_prelude = env_prelude,
+    )
 
     rule_outputs = outputs.declared_outputs + [installdir_copy.file]
     cc_toolchain = find_cpp_toolchain(ctx)
@@ -595,7 +602,7 @@ WrappedOutputs = provider(
 )
 
 # buildifier: disable=function-docstring
-def wrap_outputs(ctx, lib_name, configure_name, script_text, build_script_file = None):
+def wrap_outputs(ctx, lib_name, configure_name, script_text, env_prelude, build_script_file = None):
     extension = script_extension(ctx)
     build_log_file = ctx.actions.declare_file("{}_foreign_cc/{}.log".format(lib_name, configure_name))
     build_script_file = ctx.actions.declare_file("{}_foreign_cc/build_script{}".format(lib_name, extension))
@@ -610,15 +617,13 @@ def wrap_outputs(ctx, lib_name, configure_name, script_text, build_script_file =
     cleanup_on_success_function = create_function(
         ctx,
         "cleanup_on_success",
-        "rm -rf $BUILD_TMPDIR $EXT_BUILD_DEPS",
+        "rm -rf $$BUILD_TMPDIR$$ $$EXT_BUILD_DEPS$$",
     )
     cleanup_on_failure_function = create_function(
         ctx,
         "cleanup_on_failure",
         "\n".join([
             "##echo## \"rules_foreign_cc: Build failed!\"",
-            "##echo## \"rules_foreign_cc: Keeping temp build directory $$BUILD_TMPDIR$$ and dependencies directory $$EXT_BUILD_DEPS$$ for debug.\"",
-            "##echo## \"rules_foreign_cc: Please note that the directories inside a sandbox are still cleaned unless you specify '--sandbox_debug' Bazel command line flag.\"",
             "##echo## \"rules_foreign_cc: Printing build logs:\"",
             "##echo## \"_____ BEGIN BUILD LOGS _____\"",
             "##cat## $$BUILD_LOG$$",
@@ -626,18 +631,24 @@ def wrap_outputs(ctx, lib_name, configure_name, script_text, build_script_file =
             "##echo## \"rules_foreign_cc: Build wrapper script location: $$BUILD_WRAPPER_SCRIPT$$\"",
             "##echo## \"rules_foreign_cc: Build script location: $$BUILD_SCRIPT$$\"",
             "##echo## \"rules_foreign_cc: Build log location: $$BUILD_LOG$$\"",
+            "##echo## \"rules_foreign_cc: Keeping these below directories for debug, but note that the directories inside a sandbox\"",
+            "##echo## \"rules_foreign_cc: are still cleaned unless you specify the '--sandbox_debug' Bazel command line flag.\"",
+            "##echo## \"rules_foreign_cc: Build Dir: $$BUILD_TMPDIR$$\"",
+            "##echo## \"rules_foreign_cc: Deps Dir: $$EXT_BUILD_DEPS$$\"",
             "##echo## \"\"",
         ]),
     )
     trap_function = "##cleanup_function## cleanup_on_success cleanup_on_failure"
 
     build_command_lines = [
+        "##script_prelude##",
         "##assert_script_errors##",
         cleanup_on_success_function,
         cleanup_on_failure_function,
         # the call trap is defined inside, in a way how the shell function should be called
         # see, for instance, linux_commands.bzl
         trap_function,
+    ] + env_prelude + [
         "export BUILD_WRAPPER_SCRIPT=\"{}\"".format(wrapper_script_file.path),
         "export BUILD_SCRIPT=\"{}\"".format(build_script_file.path),
         "export BUILD_LOG=\"{}\"".format(build_log_file.path),
@@ -714,11 +725,23 @@ def _correct_path_variable(toolchain, env):
                 corrected_env[key] = ";".join(path_paths)
         env = corrected_env
 
-    value = env.get("PATH", "")
-    if not value:
+    value = env.get("PATH")
+    if value == None:
+        # avoid setting PATH if it isn't set, and vice-versa
         return env
-    value = _normalize_path(env.get("PATH", ""))
-    env["PATH"] = "$PATH:" + value
+
+    value = _normalize_path(value)
+
+    if "$PATH" not in value:
+        # Since we end up overriding the value of PATH here, we need to make
+        # sure we preserve the current value of the PATH (in case
+        # strict_action_env is not in use).  If one of the toolchains has
+        # already overridden where the PATH self-reference falls (in order to
+        # put toolchain items first, for example) we want to trust that, but
+        # otherwise we need to make sure it's referenced _somewhere_.
+        value = "$PATH:" + value
+
+    env["PATH"] = value
     return env
 
 def _list(item):

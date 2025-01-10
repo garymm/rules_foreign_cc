@@ -4,6 +4,7 @@
 load("@bazel_skylib//lib:collections.bzl", "collections")
 load("@bazel_tools//tools/build_defs/cc:action_names.bzl", "ACTION_NAMES")
 load("@bazel_tools//tools/cpp:toolchain_utils.bzl", "find_cpp_toolchain")
+load("@rules_cc//cc:defs.bzl", "CcInfo", "cc_common")
 
 LibrariesToLinkInfo = provider(
     doc = "Libraries to be wrapped into CcLinkingInfo",
@@ -335,7 +336,7 @@ def _convert_flags(compiler, flags):
         list: The converted flags
     """
     if compiler == "msvc-cl":
-        return [flag.replace("/", "-") if flag.startswith("/") else flag for flag in flags]
+        return [("-" + flag.removeprefix("/")) if flag.startswith("/") else flag for flag in flags]
     return flags
 
 def _add_if_needed(arr, add_arr):
